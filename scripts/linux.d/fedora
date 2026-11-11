@@ -25,7 +25,16 @@ REQUIRED_DEV_PACKAGES=(
     mesa-libGL-devel
     ninja-build
     openssl-devel
+    # Perl modules the OpenSSL dependency's ./config loads. Fedora ships each one apart from
+    # perl-interpreter; IPC::Cmd is the one a fresh install lacks.
+    perl-File-Basename
+    perl-File-Copy
+    perl-File-Path
     perl-FindBin
+    perl-Getopt-Std
+    perl-IPC-Cmd
+    perl-POSIX
+    perl-Scalar-List-Utils
     texinfo
     wayland-protocols-devel
     webkit2gtk4.1-devel
