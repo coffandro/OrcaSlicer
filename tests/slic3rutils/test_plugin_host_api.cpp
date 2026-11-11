@@ -337,6 +337,47 @@ TEST_CASE("Plugin host API reports no GL details before the 3D view exists", "[P
     py::object plater_type = host.attr("Plater");
     CHECK(has_attr(plater_type, "project_path"));
     CHECK(has_attr(plater_type, "export_3mf_copy"));
+    CHECK(has_attr(plater_type, "load_files"));
+    CHECK(has_attr(plater_type, "export_sliced"));
+}
+
+TEST_CASE("Plugin host API checks a filament slot colour before it needs the Orca app", "[PluginHost][Python]")
+{
+    py::object preset   = import_orca_module().attr("host").attr("preset");
+    py::object filament = preset.attr("filament");
+    REQUIRE(has_attr(filament, "set_slot_colour"));
+
+    // A valid colour reaches the same clean failure as the rest of host.preset without an app.
+    for (const char* colour : { "#ff8800", "00AA11" }) {
+        CAPTURE(colour);
+        try {
+            filament.attr("set_slot_colour")(1, colour);
+            FAIL("set_slot_colour unexpectedly succeeded without a wx application");
+        } catch (const py::error_already_set& error) {
+            CHECK(error.matches(PyExc_RuntimeError));
+            CHECK(std::string(error.what()).find("OrcaSlicer application is not initialized") != std::string::npos);
+        }
+    }
+
+    // A value that is not "#RRGGBB" is rejected before any application access.
+    for (const char* colour : { "red", "#12345", "#GGGGGG", "" }) {
+        CAPTURE(colour);
+        try {
+            filament.attr("set_slot_colour")(1, colour);
+            FAIL("set_slot_colour accepted a value that is not a colour");
+        } catch (const py::error_already_set& error) {
+            CHECK(error.matches(PyExc_ValueError));
+        }
+    }
+
+    // Only the filament editor addresses slots.
+    try {
+        preset.attr("process").attr("set_slot_colour")(1, "#FF8800");
+        FAIL("set_slot_colour on the process editor unexpectedly succeeded");
+    } catch (const py::error_already_set& error) {
+        CHECK(error.matches(PyExc_ValueError));
+        CHECK(std::string(error.what()).find("only available on") != std::string::npos);
+    }
 }
 
 TEST_CASE("Plugin host API exposes the UI module and guards it before Orca app initialization", "[PluginHost][Python]")

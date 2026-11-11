@@ -164,6 +164,11 @@ slot assignment. It must not hold raw preset pointers across reloads. Conflictin
 duplicate writes to one setting in a transaction are rejected rather than resolved
 by incidental call order.
 
+A filament slot's colour belongs to the project (`project_config.filament_colour`), not to the
+slot's preset, so it is set apart from a transaction:
+`orca.host.preset.filament.set_slot_colour(slot_number, "#RRGGBB")` takes the path the slot's colour
+picker takes, and leaves the preset unchanged.
+
 The existing one-setting filament call,
 `orca.host.preset.filament.update(slot_number, key, value)`, remains available as a
 compatibility shorthand. It shares the staged API's target resolution, selection,

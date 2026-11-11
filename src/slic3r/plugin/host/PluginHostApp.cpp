@@ -1,12 +1,17 @@
 #include "PluginHostBindings.hpp"
+#include "PluginHostUi.hpp"
 #include <pybind11/cast.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
+#include <pybind11/stl.h>
 
+#include <libslic3r/Format/ProjectStrategy.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/Print.hpp>
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/AppConfig.hpp>
 #include <libslic3r/Semver.hpp>
+#include <libslic3r/Utils.hpp>
 #include <libslic3r_version.h>
 #include <slic3r/GUI/BuildCommit.hpp>
 #include <slic3r/GUI/DeviceCore/DevManager.h>
@@ -14,7 +19,9 @@
 #include <slic3r/GUI/GUI.hpp>
 #include <slic3r/GUI/GUI_App.hpp>
 #include <slic3r/GUI/OpenGLManager.hpp>
+#include <slic3r/GUI/PartPlate.hpp>
 #include <slic3r/GUI/Plater.hpp>
+#include <slic3r/GUI/PostProcessor.hpp>
 #include <slic3r/Utils/CloudProvider.hpp>
 #include <slic3r/Utils/NetworkAgent.hpp>
 #include <slic3r/Utils/NetworkAgentFactory.hpp>
@@ -27,10 +34,12 @@
 #include <memory>
 #include <stdexcept>
 #include <wx/app.h>
+#include <wx/arrstr.h>
 #include <wx/string.h>
 #include <wx/thread.h>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -90,6 +99,74 @@ void export_3mf_copy(GUI::Plater& plater, const std::string& path)
         throw py::error_already_set();
     if (!plater.export_3mf_copy(GUI::into_path(GUI::from_u8(path))))
         throw std::runtime_error("Failed to write " + path);
+}
+
+// Add files to the plate as dropping them on the 3D view does: models are added to the project, and a
+// project file asks how to open it. Callable from any thread. On the UI thread the load is queued rather
+// than run inline: a page or window callback runs inside the web view's script handler, and the load's
+// dialogs must not nest on that native stack (see PluginHostUi's create_window).
+void load_files(GUI::Plater& plater, const std::vector<std::string>& paths)
+{
+    if (paths.empty())
+        throw py::value_error("load_files() needs at least one path");
+    wxArrayString files;
+    for (const std::string& path : paths) {
+        // The file is read from C++, so raise the audit event Python's open(path, "r") raises.
+        if (PySys_Audit("open", "ssi", path.c_str(), "r", 0) < 0)
+            throw py::error_already_set();
+        files.Add(GUI::from_u8(path));
+    }
+    if (wxIsMainThread()) {
+        GUI::wxGetApp().CallAfter([files] {
+            if (GUI::Plater* plater = GUI::wxGetApp().plater())
+                plater->load_files(files);
+        });
+        return;
+    }
+    bool loaded = false;
+    PluginHostUi::run_on_ui_thread([&] { loaded = plater.load_files(files); });
+    if (!loaded)
+        throw std::runtime_error("None of the files could be added to the plate");
+}
+
+// Write the current plate's sliced result where a plugin can send it on. A ".gcode" path gets the G-code
+// as a print host upload gets it: a copy with the printer's post-processing scripts run on it as `host`,
+// except on BBL printers, which ran them while slicing. A ".3mf" path gets the plate's G-code in a 3MF, as
+// a print job sends it to a Bambu printer.
+void export_sliced(GUI::Plater& plater, const std::string& path, const std::string& host)
+{
+    require_main_thread("export_sliced");
+    const bool to_3mf = boost::iends_with(path, ".3mf");
+    if (!to_3mf && !boost::iends_with(path, ".gcode"))
+        throw py::value_error("export_sliced() needs a path ending in .gcode or .3mf");
+
+    GUI::PartPlateList& plates = plater.get_partplate_list();
+    GUI::PartPlate*     plate  = plates.get_curr_plate();
+    if (plate == nullptr || plate->fff_print() == nullptr || !plate->is_slice_result_ready_for_export())
+        throw std::runtime_error("The current plate is not sliced, or its slice can't be printed");
+    // The 3MF carries thumbnails the 3D view renders.
+    if (to_3mf && !GUI::OpenGLManager::get_gl_info().is_detected())
+        throw std::runtime_error("export_sliced() needs the 3D view, which is not ready yet");
+    if (PySys_Audit("open", "ssi", path.c_str(), "w", 0) < 0)
+        throw py::error_already_set();
+
+    if (to_3mf) {
+        const SaveStrategy strategy = SaveStrategy::Silence | SaveStrategy::SkipModel | SaveStrategy::WithGcode | SaveStrategy::SkipAuxiliary;
+        if (plater.export_3mf(GUI::into_path(GUI::from_u8(path)), strategy, plates.get_curr_plate_index()) != 0)
+            throw std::runtime_error("Failed to write " + path);
+        return;
+    }
+
+    std::string error;
+    if (copy_file(plate->get_tmp_gcode_path(), path, error) != SUCCESS)
+        throw std::runtime_error("Failed to write " + path + ": " + error);
+    const Print& print = *plate->fff_print();
+    if (!print.is_BBL_printer()) {
+        // The working copy is a file of its own, so the scripts edit it in place (make_copy = false).
+        std::string working = path;
+        std::string output_name = boost::filesystem::path(path).filename().string();
+        run_post_process_scripts(working, false, host, output_name, print.full_print_config());
+    }
 }
 
 py::object gl_info()
@@ -168,7 +245,16 @@ void host_bindings::register_app(py::module_& host)
         })
         .def("export_3mf_copy", &export_3mf_copy, py::arg("path"),
              "Write the current project, unsaved changes included, to path as a 3MF copy. The project's "
-             "file name and saved state are not changed, and the signed-in account is not written as the designer.");
+             "file name and saved state are not changed, and the signed-in account is not written as the designer.")
+        .def("load_files", &load_files, py::arg("paths"),
+             "Add files to the plate as dropping them on the 3D view does: models are added to the project, and a "
+             "project file asks how to open it. From a background thread this waits for the load and raises "
+             "RuntimeError when no file could be added; from the UI thread the load is queued and this returns at once.")
+        .def("export_sliced", &export_sliced, py::arg("path"), py::arg("host") = "File",
+             "Write the current plate's sliced result to path, which ends in .gcode or .3mf. A .gcode file is what a "
+             "print host upload sends: the printer's post-processing scripts run on it with host as the target (BBL "
+             "printers ran them while slicing). A .3mf holds the plate's G-code, as a print job sends it to a Bambu "
+             "printer. Raises RuntimeError when the plate is not sliced or its slice can't be printed. UI thread only.");
 
     host.def("plater", &current_plater, py::return_value_policy::reference);
     host.def("model", []() -> Model& {
