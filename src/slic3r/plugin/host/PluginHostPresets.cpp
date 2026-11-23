@@ -21,7 +21,11 @@
 
 #include <pybind11/stl.h>
 
+#include <wx/event.h>
 #include <wx/string.h>
+
+#include <algorithm>
+#include <cctype>
 
 #include <set>
 #include <stdexcept>
@@ -589,6 +593,37 @@ void update_filament_slot(int slot_number, const std::string& key, const std::st
     transaction.commit();
 }
 
+// Give a 1-based filament slot one solid colour, the way picking it in the slot's colour picker does. The
+// colour belongs to the project, not to the slot's filament preset, which stays unchanged.
+void set_filament_slot_colour(int slot_number, const std::string& colour)
+{
+    // "#RRGGBB" (the "#" is optional), the form the colour picker stores. Checked by hand rather than by
+    // wxColour, whose name lookup needs a running application.
+    std::string html = colour.size() == 6 ? "#" + colour : colour;
+    const bool hex_digits = std::all_of(html.begin() + std::min<size_t>(1, html.size()), html.end(),
+                                        [](unsigned char c) { return std::isxdigit(c) != 0; });
+    if (html.size() != 7 || html.front() != '#' || !hex_digits)
+        throw std::invalid_argument("\"" + colour + "\" is not a colour; pass one like \"#FF8800\"");
+    std::transform(html.begin(), html.end(), html.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+    PluginHostUi::run_on_ui_thread([&] {
+        GUI::GUI_App& app    = require_gui_app();
+        PresetBundle& bundle = *app.preset_bundle;
+        resolved_slot_preset(bundle, slot_number); // rejects an out-of-range or unresolved slot
+        const size_t index = static_cast<size_t>(slot_number) - 1;
+        if (bundle.is_mixed_filament(index))
+            throw std::invalid_argument("Filament slot " + std::to_string(slot_number)
+                                        + " is a mixed-color virtual slot; its colour comes from its components");
+        std::vector<GUI::PlaterPresetComboBox*>& slot_combos = app.plater()->sidebar().combos_filament();
+        if (index >= slot_combos.size() || slot_combos[index] == nullptr)
+            throw std::runtime_error("Filament slot " + std::to_string(slot_number) + " has no selector in the sidebar");
+        slot_combos[index]->sync_colour_config({html}, false);
+        wxCommandEvent* event = new wxCommandEvent(GUI::EVT_FILAMENT_COLOR_CHANGED);
+        event->SetInt(static_cast<int>(index));
+        wxQueueEvent(app.plater(), event);
+    });
+}
+
 void reload_local_bundle(const std::string& bundle_id)
 {
     bool        reloaded = false;
@@ -789,7 +824,19 @@ void host_bindings::register_presets(py::module_& host)
             "preset editors accept only update(key, value); this form raises "
             "ValueError on them. Equivalent to begin_update(slot_number) with an omitted preset_name "
             "(the slot's current assignment is kept), then set(key, value) and commit(); like "
-            "begin_update() this call blocks the background Script worker.");
+            "begin_update() this call blocks the background Script worker.")
+        .def(
+            "set_slot_colour",
+            [](const PresetEditor& editor, int slot_number, const std::string& colour) {
+                if (editor.type != Preset::TYPE_FILAMENT)
+                    throw std::invalid_argument("set_slot_colour() is only available on orca.host.preset.filament");
+                set_filament_slot_colour(slot_number, colour);
+            },
+            py::arg("slot_number"), py::arg("colour"),
+            "Give a 1-based filament slot one solid colour (\"#RRGGBB\"), as picking it in the slot's colour "
+            "picker does. The colour belongs to the project; the slot's filament preset is not changed. An "
+            "invalid colour, an out-of-range or unresolved slot and a mixed-color virtual slot raise ValueError. "
+            "Runs on the UI thread; from a background thread it waits for it.");
 
     // The three preset categories edited by the main tabs. `process` is the print/process preset,
     // `printer` the machine preset and `filament` the currently edited filament preset (its
