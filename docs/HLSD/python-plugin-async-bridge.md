@@ -168,8 +168,13 @@ calls use from the Script worker. It forwards to `run_on_ui_blocking`:
   `GUI::wxGetApp().CallAfter`, and blocks on `future.get()`.
 
 Because the Script capability owns a worker thread, blocking there does not freeze the UI. The same
-primitive is used by `begin_update()`, `set()`/`commit()`, `reload_local_bundle()` and
-`list_bundle_ids()`.
+primitive is used by `begin_update()`, `set()`/`commit()`, `reload_local_bundle()`,
+`list_bundle_ids()` and `Plater.load_files()`.
+
+`Plater.load_files()` is also callable on the UI thread, from a page or window callback. There it does
+not run the load inline but queues it with `CallAfter` and returns at once, because the load's dialogs
+must not nest inside the web view's script handler. Like every marshalled call, it must not be made
+from a slicing hook (see [Slicing hooks](#slicing-hooks)).
 
 ### Synchronous `begin_update()`
 
@@ -253,11 +258,13 @@ self-cancelled plugin still records its failure.
 - **Never block the UI thread on plugin work.** Every Script launch path goes through
   `launch_script_capability`; the speed-dial `ActionRegistry` action and the Plugins dialog launcher
   return immediately and report the outcome later (see Examples).
-- **Never call `orca.host.ui.*` from a slicing hook.** The slicing worker runs while the UI thread
-  can be parked on it.
+- **Never call `orca.host.ui.*`, or a host call that marshals to the UI thread such as
+  `Plater.load_files()`, from a slicing hook.** The slicing worker runs while the UI thread can be
+  parked on it.
 - **Marshal host UI work from the Script worker only.** `PluginHostUi::run_on_ui_thread` blocks the
   calling worker while the UI thread runs the callback; calling it from the UI thread itself would
-  deadlock the marshalling path.
+  deadlock the marshalling path. A binding that must also work from a UI-thread callback queues the
+  work with `CallAfter` instead, as `Plater.load_files()` does.
 - **No pointer crosses a call boundary.** `begin_update()` returns copied category/name/slot values;
   the `SlicingPipelineContext` graph is valid only within one synchronous `execute(ctx)`.
 

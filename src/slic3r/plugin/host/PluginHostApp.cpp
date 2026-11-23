@@ -3,7 +3,6 @@
 #include <pybind11/cast.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
-#include <pybind11/stl.h>
 
 #include <libslic3r/Model.hpp>
 #include <libslic3r/PresetBundle.hpp>
@@ -15,6 +14,7 @@
 #include <slic3r/GUI/DeviceManager.hpp>
 #include <slic3r/GUI/GUI.hpp>
 #include <slic3r/GUI/GUI_App.hpp>
+#include <slic3r/GUI/MainFrame.hpp>
 #include <slic3r/GUI/OpenGLManager.hpp>
 #include <slic3r/GUI/Plater.hpp>
 #include <slic3r/Utils/CloudProvider.hpp>
@@ -23,10 +23,15 @@
 #include <slic3r/Utils/bambu_networking.hpp>
 
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
+#include <boost/log/trivial.hpp>
 #include <boost/optional/optional.hpp>
+#include <boost/system/error_code.hpp>
 
+#include <exception>
 #include <memory>
+#include <regex>
 #include <stdexcept>
 #include <wx/app.h>
 #include <wx/arrstr.h>
@@ -34,7 +39,6 @@
 #include <wx/thread.h>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace py = pybind11;
 
@@ -96,32 +100,71 @@ void export_3mf_copy(GUI::Plater& plater, const std::string& path)
         throw std::runtime_error("Failed to write " + path);
 }
 
-// Add files to the plate as dropping them on the 3D view does: models are added to the project, and a
-// project file asks how to open it. Callable from any thread. On the UI thread the load is queued rather
-// than run inline: a page or window callback runs inside the web view's script handler, and the load's
-// dialogs must not nest on that native stack (see PluginHostUi's create_window).
-void load_files(GUI::Plater& plater, const std::vector<std::string>& paths)
+// What PlaterDropTarget::OnDropFiles does around Plater::load_files: show the Prepare tab's 3D view so
+// the load happens where the user can see it, then retitle the window. The window is not raised, so a
+// background plugin doesn't steal focus. UI thread only.
+static bool load_files_as_drop(GUI::Plater& plater, const wxArrayString& files)
 {
-    if (paths.empty())
-        throw py::value_error("load_files() needs at least one path");
+    GUI::GUI_App& app = GUI::wxGetApp();
+    if (app.mainframe != nullptr)
+        app.mainframe->select_tab(TAB_ID_PREPARE);
+    if (app.is_editor())
+        plater.select_view_3D("3D");
+    const bool loaded = plater.load_files(files);
+    if (app.mainframe != nullptr)
+        app.mainframe->update_title();
+    return loaded;
+}
+
+// Add files to the plate as dropping them on the 3D view does. Callable from any thread except a
+// SlicingPipeline hook: the load stops background processing, and the UI thread can be parked waiting on
+// the slicing worker, so a call from a hook can deadlock (see PluginHostUi.hpp). On the UI thread the load
+// is queued rather than run inline: a page or window callback runs inside the web view's script handler,
+// and the load's dialogs must not nest on that native stack (see PluginHostUi's create_window).
+void load_files(GUI::Plater& plater, const py::iterable& paths)
+{
+    // The extensions Plater::load_files(const wxArrayString&) accepts; it skips any other file silently.
+    static const std::regex supported(".*[.](stp|step|stl|oltp|obj|amf|3mf|svg|zip|drc|glb|gltf|fbx|gcode|g)",
+                                      std::regex::icase);
+    // A str is iterable too, one character at a time, so reject it rather than report each character.
+    if (py::isinstance<py::str>(paths) || py::isinstance<py::bytes>(paths))
+        throw py::type_error("load_files() takes a list of paths, not a single path");
+    const py::object fspath = py::module_::import("os").attr("fspath");
     wxArrayString files;
-    for (const std::string& path : paths) {
+    for (const py::handle item : paths) {
+        const std::string path = fspath(item).cast<std::string>();
+        const boost::filesystem::path fs_path = GUI::into_path(GUI::from_u8(path));
+        boost::system::error_code ec;
+        if (!boost::filesystem::is_regular_file(fs_path, ec))
+            throw py::value_error("Not a file: " + path);
+        if (!std::regex_match(fs_path.filename().string(), supported))
+            throw py::value_error("Not a file type the plate accepts: " + path);
         // The file is read from C++, so raise the audit event Python's open(path, "r") raises.
         if (PySys_Audit("open", "ssi", path.c_str(), "r", 0) < 0)
             throw py::error_already_set();
         files.Add(GUI::from_u8(path));
     }
+    if (files.empty())
+        throw py::value_error("load_files() needs at least one path");
     if (wxIsMainThread()) {
         GUI::wxGetApp().CallAfter([files] {
-            if (GUI::Plater* plater = GUI::wxGetApp().plater())
-                plater->load_files(files);
+            // Same rules as create_window's deferral: the app may be closing by now, and an exception
+            // escaping into the main loop ends it (GUI_App::OnExceptionInMainLoop returns false).
+            if (GUI::wxGetApp().is_closing())
+                return;
+            try {
+                if (GUI::Plater* plater = GUI::wxGetApp().plater())
+                    load_files_as_drop(*plater, files);
+            } catch (const std::exception& e) {
+                BOOST_LOG_TRIVIAL(error) << "Plugin load_files failed: " << e.what();
+            }
         });
         return;
     }
     bool loaded = false;
-    PluginHostUi::run_on_ui_thread([&] { loaded = plater.load_files(files); });
+    PluginHostUi::run_on_ui_thread([&] { loaded = load_files_as_drop(plater, files); });
     if (!loaded)
-        throw std::runtime_error("None of the files could be added to the plate");
+        throw std::runtime_error("The files were not loaded (the load failed or was cancelled)");
 }
 
 py::object gl_info()
@@ -202,9 +245,14 @@ void host_bindings::register_app(py::module_& host)
              "Write the current project, unsaved changes included, to path as a 3MF copy. The project's "
              "file name and saved state are not changed, and the signed-in account is not written as the designer.")
         .def("load_files", &load_files, py::arg("paths"),
-             "Add files to the plate as dropping them on the 3D view does: models are added to the project, and a "
-             "project file asks how to open it. From a background thread this waits for the load and raises "
-             "RuntimeError when no file could be added; from the UI thread the load is queued and this returns at once.");
+             "Add files to the plate as dropping them on the 3D view does. paths is an iterable of str or "
+             "os.PathLike. Models are added to the project, a project file asks how to open it, and a G-code file "
+             "replaces the project and opens in the preview. The Prepare tab's 3D view is shown first. A path that "
+             "isn't an existing file of a type the plate accepts raises ValueError before anything is loaded. "
+             "From a background thread this waits for the load and raises RuntimeError when the files were not "
+             "loaded, which includes the user cancelling one of the load's prompts; from the UI thread the load is "
+             "queued and this returns at once. Do not call it from a SlicingPipeline hook: the load waits for the "
+             "UI thread, which can be waiting for the slicing worker, so the call can deadlock.");
 
     host.def("plater", &current_plater, py::return_value_policy::reference);
     host.def("model", []() -> Model& {
