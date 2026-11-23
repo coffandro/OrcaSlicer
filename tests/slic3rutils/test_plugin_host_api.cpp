@@ -336,6 +336,16 @@ TEST_CASE("Plugin host API reports unavailable GUI objects before Orca app initi
         CHECK(error.matches(PyExc_RuntimeError));
         CHECK(std::string(error.what()).find("OrcaSlicer application is not initialized") != std::string::npos);
     }
+
+    // A vendor the build doesn't ship is rejected before the application is needed.
+    for (const char* vendor : {"NoSuchVendorForPluginTest", "", "../profiles/BBL"}) {
+        try {
+            host.attr("preset").attr("install_printer")(vendor, "Some Model", "0.4");
+            FAIL("host.preset.install_printer unexpectedly accepted an unknown vendor");
+        } catch (const py::error_already_set& error) {
+            CHECK(error.matches(PyExc_ValueError));
+        }
+    }
 }
 
 TEST_CASE("Plugin host API reports no GL details before the 3D view exists", "[PluginHost][Python]")
