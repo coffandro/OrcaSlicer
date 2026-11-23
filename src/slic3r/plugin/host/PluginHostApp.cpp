@@ -1,7 +1,9 @@
 #include "PluginHostBindings.hpp"
+#include "PluginHostUi.hpp"
 #include <pybind11/cast.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
+#include <pybind11/stl.h>
 
 #include <libslic3r/Model.hpp>
 #include <libslic3r/PresetBundle.hpp>
@@ -27,10 +29,12 @@
 #include <memory>
 #include <stdexcept>
 #include <wx/app.h>
+#include <wx/arrstr.h>
 #include <wx/string.h>
 #include <wx/thread.h>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -90,6 +94,34 @@ void export_3mf_copy(GUI::Plater& plater, const std::string& path)
         throw py::error_already_set();
     if (!plater.export_3mf_copy(GUI::into_path(GUI::from_u8(path))))
         throw std::runtime_error("Failed to write " + path);
+}
+
+// Add files to the plate as dropping them on the 3D view does: models are added to the project, and a
+// project file asks how to open it. Callable from any thread. On the UI thread the load is queued rather
+// than run inline: a page or window callback runs inside the web view's script handler, and the load's
+// dialogs must not nest on that native stack (see PluginHostUi's create_window).
+void load_files(GUI::Plater& plater, const std::vector<std::string>& paths)
+{
+    if (paths.empty())
+        throw py::value_error("load_files() needs at least one path");
+    wxArrayString files;
+    for (const std::string& path : paths) {
+        // The file is read from C++, so raise the audit event Python's open(path, "r") raises.
+        if (PySys_Audit("open", "ssi", path.c_str(), "r", 0) < 0)
+            throw py::error_already_set();
+        files.Add(GUI::from_u8(path));
+    }
+    if (wxIsMainThread()) {
+        GUI::wxGetApp().CallAfter([files] {
+            if (GUI::Plater* plater = GUI::wxGetApp().plater())
+                plater->load_files(files);
+        });
+        return;
+    }
+    bool loaded = false;
+    PluginHostUi::run_on_ui_thread([&] { loaded = plater.load_files(files); });
+    if (!loaded)
+        throw std::runtime_error("None of the files could be added to the plate");
 }
 
 py::object gl_info()
@@ -168,7 +200,11 @@ void host_bindings::register_app(py::module_& host)
         })
         .def("export_3mf_copy", &export_3mf_copy, py::arg("path"),
              "Write the current project, unsaved changes included, to path as a 3MF copy. The project's "
-             "file name and saved state are not changed, and the signed-in account is not written as the designer.");
+             "file name and saved state are not changed, and the signed-in account is not written as the designer.")
+        .def("load_files", &load_files, py::arg("paths"),
+             "Add files to the plate as dropping them on the 3D view does: models are added to the project, and a "
+             "project file asks how to open it. From a background thread this waits for the load and raises "
+             "RuntimeError when no file could be added; from the UI thread the load is queued and this returns at once.");
 
     host.def("plater", &current_plater, py::return_value_policy::reference);
     host.def("model", []() -> Model& {
