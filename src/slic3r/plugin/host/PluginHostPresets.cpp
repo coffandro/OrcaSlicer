@@ -16,7 +16,7 @@
 #include <slic3r/GUI/GUI_App.hpp>
 #include <slic3r/GUI/MainFrame.hpp>
 #include <slic3r/GUI/Plater.hpp>
-#include <slic3r/GUI/PresetComboBoxes.hpp> // TabPresetComboBox::set_filament_idx
+#include <slic3r/GUI/PresetComboBoxes.hpp> // TabPresetComboBox::set_filament_idx, PlaterPresetComboBox::sync_colour_config
 #include <slic3r/GUI/Tab.hpp>
 
 #include <pybind11/stl.h>
@@ -835,7 +835,8 @@ void host_bindings::register_presets(py::module_& host)
             py::arg("slot_number"), py::arg("colour"),
             "Give a 1-based filament slot one solid colour (\"#RRGGBB\"), as picking it in the slot's colour "
             "picker does. The colour belongs to the project; the slot's filament preset is not changed. An "
-            "invalid colour, an out-of-range or unresolved slot and a mixed-color virtual slot raise ValueError. "
+            "invalid colour or a mixed-color virtual slot raises ValueError, an out-of-range slot IndexError, and "
+            "an empty or unresolved slot, or one with no selector in the sidebar, RuntimeError. "
             "Runs on the UI thread; from a background thread it waits for it.");
 
     // The three preset categories edited by the main tabs. `process` is the print/process preset,
