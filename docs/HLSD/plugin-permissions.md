@@ -402,10 +402,16 @@ never treated as an opt-out.
   `CreateProcess` still resolves the executable from the working directory, `PATH`, and the
   filesystem, so the same approved command line can start a different binary later; the
   grant does not pin the resolved image or verify it.
-- **Host APIs are not audit events.** Calls into OrcaSlicer's Python host APIs, such as
-  preset updates or UI actions, execute C++ host code and follow that API's contract. The
+- **Host APIs are judged by what they raise.** Calls into OrcaSlicer's Python host APIs, such
+  as preset updates or UI actions, execute C++ host code and follow that API's contract. The
   audit hook judges the Python-level filesystem, network, process and thread events it is
-  given, not the host API's internal work.
+  given, not the host API's internal work. A host API that reads or writes a path the plugin
+  chose raises the `open` event Python's `open()` would, so the plugin's file grants apply:
+  `Plater.export_3mf_copy` and `Plater.export_sliced` raise it for the file they write.
+  Nothing else the call does is an event:
+  `export_sliced` runs the printer's post-processing scripts as subprocesses without a
+  `process` event, so a plugin with only a write grant can start them. They are the scripts
+  the user configured on the printer and run on every export of a slice anyway.
 - **Denied paths are a direct-access block.** Path laundering through a symlink,
   hardlink, subprocess, or Windows 8.3 short name is outside the model. A tree grant is
   canonicalized for matching, but the deny check itself is base-name and component based.

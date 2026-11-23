@@ -3,10 +3,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 
+#include <libslic3r/Format/ProjectStrategy.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/Print.hpp>
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/AppConfig.hpp>
 #include <libslic3r/Semver.hpp>
+#include <libslic3r/Utils.hpp>
 #include <libslic3r_version.h>
 #include <slic3r/GUI/BuildCommit.hpp>
 #include <slic3r/GUI/DeviceCore/DevManager.h>
@@ -14,15 +17,19 @@
 #include <slic3r/GUI/GUI.hpp>
 #include <slic3r/GUI/GUI_App.hpp>
 #include <slic3r/GUI/OpenGLManager.hpp>
+#include <slic3r/GUI/PartPlate.hpp>
 #include <slic3r/GUI/Plater.hpp>
+#include <slic3r/GUI/PostProcessor.hpp>
 #include <slic3r/Utils/CloudProvider.hpp>
 #include <slic3r/Utils/NetworkAgent.hpp>
 #include <slic3r/Utils/NetworkAgentFactory.hpp>
 #include <slic3r/Utils/bambu_networking.hpp>
 
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/optional/optional.hpp>
+#include <boost/system/error_code.hpp>
 
 #include <memory>
 #include <stdexcept>
@@ -90,6 +97,78 @@ void export_3mf_copy(GUI::Plater& plater, const std::string& path)
         throw py::error_already_set();
     if (!plater.export_3mf_copy(GUI::into_path(GUI::from_u8(path))))
         throw std::runtime_error("Failed to write " + path);
+}
+
+// Write the current plate's sliced result where a plugin can send it on. A ".gcode" path gets the G-code
+// as Orca's own export and print host upload produce it: the printer's post-processing scripts and
+// slicing-pipeline plugins run on a copy with `host` as the target, except on BBL printers, which ran them
+// while slicing. A ".3mf" path gets the plate's G-code in a 3MF, as a print job sends it to a Bambu printer.
+// Returns where the G-code went: the written path for host "File" (a script may rename it), or the name to
+// send it under for any other host. The 3MF path is returned unchanged.
+std::string export_sliced(GUI::Plater& plater, const std::string& path, const std::string& host)
+{
+    require_main_thread("export_sliced");
+    const bool to_3mf = boost::iends_with(path, ".3mf");
+    if (!to_3mf && !boost::iends_with(path, ".gcode"))
+        throw py::value_error("export_sliced() needs a path ending in .gcode or .3mf");
+    // Plater::export_3mf runs the scripts itself, always for the "File" target.
+    if (to_3mf && host != "File")
+        throw py::value_error("export_sliced() takes a host only for a .gcode path");
+
+    GUI::PartPlateList& plates = plater.get_partplate_list();
+    GUI::PartPlate*     plate  = plates.get_curr_plate();
+    // The same rules as Orca's buttons: Export G-code and the print host upload only need a valid slice,
+    // while Print / Export plate sliced file also refuse a slice that can't be printed.
+    const bool ready = plate != nullptr && plate->fff_print() != nullptr &&
+                       (to_3mf ? plate->is_slice_result_ready_for_export() : plate->is_slice_result_valid());
+    if (!ready)
+        throw std::runtime_error(to_3mf ? "The current plate is not sliced, or its slice can't be printed" :
+                                          "The current plate is not sliced");
+    // The 3MF carries thumbnails the 3D view renders.
+    if (to_3mf && !GUI::OpenGLManager::get_gl_info().is_detected())
+        throw std::runtime_error("export_sliced() needs the 3D view, which is not ready yet");
+    if (PySys_Audit("open", "ssi", path.c_str(), "w", 0) < 0)
+        throw py::error_already_set();
+
+    if (to_3mf) {
+        const SaveStrategy strategy = SaveStrategy::Silence | SaveStrategy::SkipModel | SaveStrategy::WithGcode | SaveStrategy::SkipAuxiliary;
+        if (plater.export_3mf(GUI::into_path(GUI::from_u8(path)), strategy, plates.get_curr_plate_index()) != 0)
+            throw std::runtime_error("Failed to write " + path);
+        return path;
+    }
+
+    // As finalize_gcode() does, the scripts run on a copy, and the target is written only once they succeed:
+    // a failed script leaves neither half-processed G-code nor a clobbered file at the target. The copy sits
+    // next to the target so the final rename stays on one file system.
+    namespace fs = boost::filesystem;
+    const fs::path target = GUI::into_path(GUI::from_u8(path));
+    const std::string working_path =
+        (target.parent_path() / fs::unique_path("." SLIC3R_APP_KEY ".export.%%%%-%%%%-%%%%-%%%%.gcode")).string();
+    ScopeGuard remove_working([&working_path] {
+        boost::system::error_code ec;
+        fs::remove(working_path, ec);
+    });
+    std::string error;
+    if (copy_file(plate->get_tmp_gcode_path(), working_path, error) != SUCCESS)
+        throw std::runtime_error("Failed to write " + path + ": " + error);
+
+    // For "File" the scripts get the full target path, as finalize_gcode() passes it, and may rename it
+    // through <file>.output_name; any other host gets the file name to upload under, as prepare_upload() does.
+    std::string output_name = host == "File" ? path : target.filename().string();
+    const Print& print = *plate->fff_print();
+    if (!print.is_BBL_printer()) {
+        // The working copy is a file of its own, so the scripts edit it in place (make_copy = false).
+        std::string working = working_path;
+        run_post_process_scripts(working, false, host, output_name, print.full_print_config());
+    }
+
+    const std::string final_path = host == "File" ? output_name : path;
+    if (final_path != path && PySys_Audit("open", "ssi", final_path.c_str(), "w", 0) < 0)
+        throw py::error_already_set();
+    // A script may move the file to another directory, possibly on another file system, where only a copy works.
+    if (rename_file(working_path, final_path) && copy_file(working_path, final_path, error) != SUCCESS)
+        throw std::runtime_error("Failed to write " + final_path + ": " + error);
+    return output_name;
 }
 
 py::object gl_info()
@@ -168,7 +247,21 @@ void host_bindings::register_app(py::module_& host)
         })
         .def("export_3mf_copy", &export_3mf_copy, py::arg("path"),
              "Write the current project, unsaved changes included, to path as a 3MF copy. The project's "
-             "file name and saved state are not changed, and the signed-in account is not written as the designer.");
+             "file name and saved state are not changed, and the signed-in account is not written as the designer.")
+        .def("export_sliced", &export_sliced, py::arg("path"), py::arg("host") = "File",
+             "Write the current plate's sliced result to path, which ends in .gcode or .3mf.\n\n"
+             "A .gcode file is what Orca's Export G-code or print host upload produces: the printer's "
+             "post-processing scripts, and the slicing-pipeline plugins it uses, run on it with host as the target "
+             "(BBL printers ran them while slicing). Other plugins' code therefore runs inside this call, which may "
+             "also wait up to 10 s for plugins that are still loading. path is written only once they succeed. For "
+             "host \"File\" a script may move the file, and the path it was written to is returned; for any other "
+             "host the file stays at path, and the name to send it under (path's file name unless a script changed "
+             "it) is returned. Needs a sliced plate, as Export G-code does.\n\n"
+             "A .3mf holds the plate's G-code, as a print job sends it to a Bambu printer, and path is returned. It "
+             "needs a slice that can be printed, as Print does. host does not apply to it: Orca runs the "
+             "post-processing scripts for the \"File\" target, and a failing script shows Orca's error dialog "
+             "before this raises.\n\n"
+             "Raises RuntimeError when the plate is not ready or the export fails. UI thread only.");
 
     host.def("plater", &current_plater, py::return_value_policy::reference);
     host.def("model", []() -> Model& {
