@@ -93,6 +93,8 @@ TEST_CASE("Plugin host API exposes host-owned bundle and preset surface to Pytho
     py::object bundles = preset.attr("bundles");
     CHECK(has_attr(bundles, "list_ids"));
     CHECK(has_attr(bundles, "reload_local"));
+    CHECK(has_attr(preset, "printer_models"));
+    CHECK(has_attr(preset, "install_printer"));
     CHECK_FALSE(has_attr(host, "reload_local_bundle"));
     CHECK_FALSE(has_attr(host, "list_bundle_ids"));
 
@@ -335,6 +337,24 @@ TEST_CASE("Plugin host API reports unavailable GUI objects before Orca app initi
     } catch (const py::error_already_set& error) {
         CHECK(error.matches(PyExc_RuntimeError));
         CHECK(std::string(error.what()).find("OrcaSlicer application is not initialized") != std::string::npos);
+    }
+
+    try {
+        host.attr("preset").attr("printer_models")();
+        FAIL("host.preset.printer_models unexpectedly succeeded without a wx application");
+    } catch (const py::error_already_set& error) {
+        CHECK(error.matches(PyExc_RuntimeError));
+        CHECK(std::string(error.what()).find("OrcaSlicer application is not initialized") != std::string::npos);
+    }
+
+    // A vendor the build doesn't ship is rejected before the application is needed.
+    for (const char* vendor : {"NoSuchVendorForPluginTest", "", "../profiles/BBL"}) {
+        try {
+            host.attr("preset").attr("install_printer")(vendor, "Some Model", "0.4");
+            FAIL("host.preset.install_printer unexpectedly accepted an unknown vendor");
+        } catch (const py::error_already_set& error) {
+            CHECK(error.matches(PyExc_ValueError));
+        }
     }
 }
 
