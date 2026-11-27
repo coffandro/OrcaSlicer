@@ -9,34 +9,31 @@
 
 #include <cstddef>
 #include <libslic3r/AppConfig.hpp>
-#include <libslic3r/Config.hpp>
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/PresetBundle.hpp>
 #include <libslic3r/Utils.hpp>
 
 #include <slic3r/GUI/GUI.hpp>
 #include <slic3r/GUI/GUI_App.hpp>
-#include <slic3r/GUI/I18N.hpp>
 #include <slic3r/GUI/MainFrame.hpp>
+#include <slic3r/GUI/Operations/InstallOps.hpp>
 #include <slic3r/GUI/Operations/Outcome.hpp>
 #include <slic3r/GUI/Operations/PresetOps.hpp>
 #include <slic3r/GUI/Plater.hpp>
 #include <slic3r/GUI/PresetComboBoxes.hpp> // TabPresetComboBox::set_filament_idx
 #include <slic3r/GUI/Tab.hpp>
-#include <slic3r/GUI/UnsavedChangesDialog.hpp> // ActionButtons
 
 #include <pybind11/stl.h>
+
+#include <nlohmann/json.hpp>
 
 #include <wx/string.h>
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
-#include <boost/log/trivial.hpp>
 #include <boost/system/error_code.hpp>
 
-#include <algorithm>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -541,171 +538,110 @@ std::vector<std::string> list_bundle_ids()
     return ids;
 }
 
-// One FFF printer model, as Orca's printer selection ("Select/Remove printers") offers it.
-struct PrinterModelRow
+// An install operation's refusal as the exception a plugin gets: ValueError for a vendor, model or
+// nozzle that isn't listed, RuntimeError otherwise (unsaved preset changes among them). The text is the
+// operation's.
+[[noreturn]] void throw_install_refusal(const GUI::Ops::Refusal& refusal)
 {
-    std::string              vendor;      // the vendor's id: its profile's file name
-    std::string              vendor_name;
-    std::string              model;       // the model's id, as AppConfig's vendor map keys it
-    std::string              name;
-    std::vector<std::string> variants;    // nozzle variants, as "0.4"
-    std::vector<std::string> default_materials;
-};
-
-void append_fff_models(std::vector<PrinterModelRow>& rows, const std::string& vendor_id, const VendorProfile& vendor)
-{
-    for (const VendorProfile::PrinterModel& model : vendor.models) {
-        if (model.technology != ptFFF)
-            continue;
-        PrinterModelRow row{vendor_id, vendor.name, model.id, model.name, {}, model.default_materials};
-        for (const VendorProfile::PrinterVariant& variant : model.variants)
-            row.variants.push_back(variant.name);
-        rows.push_back(std::move(row));
-    }
+    const std::string& code = refusal.code;
+    if (code == "no_such_vendor" || code == "no_such_model" || code == "ambiguous_model" || code == "no_such_nozzle")
+        throw std::invalid_argument(refusal.english());
+    throw std::runtime_error(refusal.english());
 }
 
-// The models in the resources, read once: they do not change while Orca runs. Needs no UI thread: the
-// models are loaded into a bundle of their own. The first call parses every vendor's model files, on the
-// caller's thread.
-const std::vector<PrinterModelRow>& shipped_printer_models()
+// The printer models the Printer Selection dialog lists, read as it reads them (GUI::Ops::printer_profile_data()),
+// with the nozzles of each that are installed.
+struct PrinterModelList
 {
-    static std::once_flag                once;
-    static std::vector<PrinterModelRow> models;
-    std::call_once(once, [] {
-        PresetBundle shipped;
-        const std::string errors =
-            shipped.load_system_models_from_json(ForwardCompatibilitySubstitutionRule::EnableSystemSilent).second;
-        if (!errors.empty())
-            BOOST_LOG_TRIVIAL(warning) << "Plugin printer list: some vendor profiles could not be read and are left out:\n"
-                                       << errors;
-        for (const auto& [vendor_id, vendor] : shipped.vendors)
-            append_fff_models(models, vendor_id, vendor);
-    });
-    return models;
-}
-
-// The printer models as the printer selection lists them, and the models and nozzles already selected.
-// An installed vendor's models come from its installed profile, which the preset updater may have made
-// newer than the resources; any other vendor's come from the resources.
-struct PrinterModels
-{
-    std::vector<PrinterModelRow> rows;
-    AppConfig::VendorMap         selected;
+    nlohmann::json                      profile;
+    std::vector<GUI::Ops::PrinterModel> models;
 };
 
-PrinterModels printer_model_list()
+PrinterModelList printer_model_list()
 {
-    PrinterModels out;
+    GUI::Ops::InstallSet installed;
     PluginHostUi::run_on_ui_thread([&] {
-        GUI::GUI_App& app = GUI::wxGetApp();
-        if (app.is_closing())
-            throw std::runtime_error("OrcaSlicer is closing");
-        if (app.app_config == nullptr || app.preset_bundle == nullptr)
-            throw std::runtime_error("OrcaSlicer's presets are not available");
-        out.selected = app.app_config->vendors();
-        for (const auto& [vendor_id, vendor] : app.preset_bundle->vendors)
-            append_fff_models(out.rows, vendor_id, vendor);
+        require_gui_app();
+        installed = GUI::Ops::installed_set();
     });
-    std::set<std::string> installed;
-    for (const PrinterModelRow& row : out.rows)
-        installed.insert(row.vendor);
-    const std::vector<PrinterModelRow>* shipped = nullptr;
-    {
+    // Off the UI thread, as the dialog reads it: the first read after a profile update loads every vendor.
+    const GUI::Ops::Outcome<nlohmann::json> profile = [] {
         py::gil_scoped_release nogil;
-        shipped = &shipped_printer_models();
-    }
-    for (const PrinterModelRow& row : *shipped)
-        if (installed.count(row.vendor) == 0)
-            out.rows.push_back(row);
-    return out;
+        return GUI::Ops::printer_profile_data();
+    }();
+    if (!profile)
+        throw_install_refusal(profile.refusal());
+    PrinterModelList list{profile.value(), {}};
+    list.models = GUI::Ops::printer_models_from(list.profile, installed, "", "");
+    return list;
 }
 
 py::list printer_models()
 {
-    const PrinterModels models = printer_model_list();
+    const PrinterModelList list = printer_model_list();
+    std::map<std::pair<std::string, std::string>, std::string> names; // (vendor, model) -> the model's name
+    if (const auto entries = list.profile.find("model"); entries != list.profile.end() && entries->is_array())
+        for (const nlohmann::json& entry : *entries)
+            if (entry.is_object())
+                names[{entry.value("vendor", ""), entry.value("model", "")}] = entry.value("name", "");
     py::list out;
-    for (const PrinterModelRow& row : models.rows) {
-        std::vector<std::string> installed_variants;
-        if (auto vendor = models.selected.find(row.vendor); vendor != models.selected.end())
-            if (auto model = vendor->second.find(row.model); model != vendor->second.end())
-                installed_variants.assign(model->second.begin(), model->second.end());
+    for (const GUI::Ops::PrinterModel& model : list.models) {
+        const auto name = names.find({model.vendor, model.model});
         py::dict item;
-        item["vendor"]             = row.vendor;
-        item["vendor_name"]        = row.vendor_name;
-        item["model"]              = row.model;
-        item["name"]               = row.name;
-        item["variants"]           = py::cast(row.variants);
-        item["installed_variants"] = py::cast(installed_variants);
+        item["vendor"]             = model.vendor;
+        item["model"]              = model.model;
+        item["name"]               = name != names.end() && !name->second.empty() ? name->second : model.model;
+        item["variants"]           = py::cast(model.nozzles);
+        item["installed_variants"] = py::cast(model.installed_nozzles);
         out.append(std::move(item));
     }
     return out;
 }
 
-// What "Select/Remove printers" does for one model and nozzle: install the vendor's profiles when they
-// are not yet, add the model to the selected printers along with its default filaments, and reload the
-// presets. Unsaved preset changes are asked about first, as that dialog does; declining cancels.
-void install_printer(const std::string& vendor, const std::string& model, const std::string& variant)
+// Adds one printer model and nozzle as the Printer Selection dialog's Confirm does, through the operation it and
+// the MCP printer_install command share (GUI::Ops::install_printers()).
+py::dict install_printer(const std::string& vendor, const std::string& model, const std::string& variant,
+                         const std::string& preset_changes)
 {
-    // Profiles are installed from the resources, so a vendor must ship there. Checked before anything else,
-    // as it needs neither the application nor parsing the profiles.
+    GUI::Ops::PresetChanges changes = GUI::Ops::PresetChanges::Ask;
+    if (preset_changes == "transfer")
+        changes = GUI::Ops::PresetChanges::Transfer;
+    else if (preset_changes == "discard")
+        changes = GUI::Ops::PresetChanges::Discard;
+    else if (!preset_changes.empty())
+        throw std::invalid_argument("preset_changes is \"transfer\", \"discard\" or empty, not \"" + preset_changes + "\"");
+
+    // Profiles are installed from the resources, so a vendor must ship there. Checked first, as it needs neither
+    // the application nor reading the profiles.
     const boost::filesystem::path vendor_file = boost::filesystem::path(resources_dir()) / "profiles" / (vendor + ".json");
     boost::system::error_code ec;
     if (vendor.empty() || vendor.find_first_of("/\\") != std::string::npos ||
         !boost::filesystem::is_regular_file(vendor_file, ec))
         throw std::invalid_argument("OrcaSlicer ships no printer vendor \"" + vendor + "\"");
 
-    const PrinterModels models = printer_model_list();
-    auto row = std::find_if(models.rows.begin(), models.rows.end(), [&](const PrinterModelRow& r) {
-        return r.vendor == vendor && r.model == model && std::find(r.variants.begin(), r.variants.end(), variant) != r.variants.end();
-    });
-    if (row == models.rows.end())
-        throw std::invalid_argument("OrcaSlicer has no printer \"" + model + "\" with variant \"" + variant +
-                                    "\" from vendor \"" + vendor + "\"");
-    // The default filaments are selected, as the printer selection selects them when a model is ticked;
-    // apply_vendor_config turns their @System names into the vendor's own.
-    std::map<std::string, std::string> filaments;
-    for (const std::string& material : row->default_materials)
-        filaments.emplace(material, "true");
+    GUI::Ops::InstallPrintersArgs args;
+    args.models  = {GUI::Ops::ModelNozzles{vendor, model, {variant}}};
+    args.known   = printer_model_list().models;
+    args.changes = changes;
+    // A model or nozzle that isn't listed is refused before the UI thread is asked for anything.
+    if (const GUI::Ops::Outcome<std::vector<GUI::Ops::ModelNozzles>> resolved = GUI::Ops::resolve_models(args.known, args.models);
+        !resolved)
+        throw_install_refusal(resolved.refusal());
 
-    bool        cancelled = false;
-    std::string error;
+    std::vector<std::string> added;
+    std::string              selected;
     PluginHostUi::run_on_ui_thread([&] {
-        GUI::GUI_App& app = GUI::wxGetApp();
-        if (app.is_closing())
-            throw std::runtime_error("OrcaSlicer is closing");
-        if (app.preset_bundle == nullptr || app.app_config == nullptr || app.mainframe == nullptr)
-            throw std::runtime_error("OrcaSlicer's presets are not available");
-
-        const AppConfig::VendorMap& vendors = app.app_config->vendors();
-        if (auto v = vendors.find(vendor); v != vendors.end())
-            if (auto m = v->second.find(model); m != v->second.end() && m->second.count(variant))
-                return;
-
-        bool keep_changes = false;
-        if (!app.check_and_keep_current_preset_changes(_L("Configuration package changed"),
-                                                       // TRN Shown above the unsaved preset changes when a plugin adds a printer.
-                                                       _L("A plugin is adding a printer, which reloads the presets."),
-                                                       GUI::ActionButtons::KEEP | GUI::ActionButtons::SAVE, &keep_changes)) {
-            cancelled = true;
-            return;
-        }
-        // Loading the presets again starts from the selections stored in the app config.
-        app.preset_bundle->export_selections(*app.app_config);
-        if (!app.preset_bundle->apply_vendor_config({{vendor, {{model, {variant}}}}}, filaments, app.app_config, false)) {
-            error = "OrcaSlicer could not install the profiles of vendor \"" + vendor + "\"";
-            return;
-        }
-        if (keep_changes)
-            app.apply_keeped_preset_modifications();
-        app.app_config->save();
-        // Keeping the changes has reloaded the presets already.
-        if (!keep_changes)
-            app.load_current_presets();
+        require_gui_app();
+        const GUI::Ops::Outcome<GUI::Ops::InstalledPrinters> done = GUI::Ops::install_printers(args);
+        if (!done)
+            throw_install_refusal(done.refusal());
+        added    = done.value().added;
+        selected = done.value().selected;
     });
-    if (cancelled)
-        throw std::runtime_error("Adding the printer was canceled");
-    if (!error.empty())
-        throw std::runtime_error(error);
+    py::dict out;
+    out["added"]    = py::cast(added);
+    out["selected"] = selected;
+    return out;
 }
 
 } // namespace
@@ -727,16 +663,19 @@ void host_bindings::register_presets(py::module_& host)
                 "IDs of local preset bundles in the active user's _local directory that reload_local() accepts, "
                 "including bundles added after startup.");
     preset.def("printer_models", &printer_models,
-               "Every FFF printer model OrcaSlicer's printer selection (\"Select/Remove printers\") offers: dicts of "
-               "vendor, vendor_name, model, name, variants (nozzles, as \"0.4\") and installed_variants (those already "
-               "in the printer list). An installed vendor's models come from its installed, possibly updated, profile; "
-               "the others from the profiles OrcaSlicer ships. The first call reads every vendor's models, on the "
-               "calling thread, so make it from a background thread where possible.");
+               "Every printer model the Printer Selection dialog (\"Select/Remove printers\") lists, from the profiles "
+               "OrcaSlicer ships or has installed: dicts of vendor and model (their ids), name, variants (nozzles, as "
+               "\"0.4\") and installed_variants (those in the printer list). The first call after a profile update "
+               "reads every vendor's profile, so make it from a background thread where possible.");
     preset.def("install_printer", &install_printer, py::arg("vendor"), py::arg("model"), py::arg("variant"),
-               "Add one printer model and nozzle variant to the printer list, as \"Select/Remove printers\" does: "
-               "installs the vendor's profiles if needed, selects the model's default filaments and reloads the presets. "
-               "A vendor, model or variant printer_models() doesn't list raises ValueError. Asks about unsaved preset "
-               "changes first; raises RuntimeError if that is declined. Does nothing if it is installed already.");
+               py::arg("preset_changes") = "",
+               "Add one printer model and nozzle variant to the printer list, as the Printer Selection dialog's Confirm "
+               "does: installs the vendor's profiles if needed and reloads the presets, which installs the model's "
+               "default filaments where no installed filament fits it. Returns {added: the printer presets now offered, "
+               "selected: the printer preset selected afterwards}. A model already installed changes nothing. Opens no "
+               "dialog: with unsaved preset changes it raises RuntimeError unless preset_changes is \"transfer\" or "
+               "\"discard\", which answers for the person. A vendor, model or variant printer_models() doesn't list "
+               "raises ValueError.");
 
     py::enum_<Preset::Type>(host, "PresetType",
                             "Kind of preset: the type of a Preset, and the category a PresetEditor, PresetTransaction "

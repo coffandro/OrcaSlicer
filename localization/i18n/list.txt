@@ -418,7 +418,6 @@ src/slic3r/plugin/PluginHooks.cpp
 src/slic3r/plugin/PluginLoader.cpp
 src/slic3r/plugin/PluginManager.cpp
 src/slic3r/plugin/PythonPluginBridge.cpp
-src/slic3r/plugin/host/PluginHostPresets.cpp
 src/libslic3r/CAD/SketchEngine.cpp
 src/libslic3r/CAD/GeometryEngine.cpp
 src/libslic3r/FilamentMixer.cpp

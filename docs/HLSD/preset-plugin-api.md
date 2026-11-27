@@ -168,17 +168,17 @@ slot assignment. It must not hold raw preset pointers across reloads. Conflictin
 duplicate writes to one setting in a transaction are rejected rather than resolved
 by incidental call order.
 
-Printers a plugin wants in the printer list can be added the way "Select/Remove printers" adds them:
-`orca.host.preset.printer_models()` lists every FFF printer model the printer selection offers
-(`vendor`, `vendor_name`, `model`, `name`, `variants`, `installed_variants`): an installed vendor's
-models from its installed profile, which the preset updater may have made newer than the resources,
-and any other vendor's from the resources. `orca.host.preset.install_printer(vendor, model, variant)`
-validates against that list and installs one model and nozzle: the vendor's profiles if they are not
-installed yet, the model in the selected printers with its `default_materials` selected, and the
-presets reloaded. The resources' model list is parsed once, on the first call's thread, so a call
-from a UI-thread callback pays that cost on the UI thread.
-Unsaved preset changes are asked about first, as the printer selection does; declining raises
-`RuntimeError`. A model already installed is left alone.
+Printers a plugin wants in the printer list are added through the install operations the Printer
+Selection dialog and the MCP `printer_install` command share (`GUI/Operations/InstallOps`).
+`orca.host.preset.printer_models()` lists the models the dialog lists (`vendor`, `model`, `name`,
+`variants`, `installed_variants`), read off the UI thread as the dialog reads them.
+`orca.host.preset.install_printer(vendor, model, variant, preset_changes="")` adds one model and nozzle
+with `GUI::Ops::install_printers()`: the vendor's profiles if they are not installed yet, the model in
+the printer list, and the presets reloaded, which installs the model's default filaments where no
+installed filament fits it. Like every operation it opens no dialog: with unsaved preset changes it is
+refused (`RuntimeError`) unless `preset_changes` is `"transfer"` or `"discard"`, as the MCP command's
+argument of that name. A name the list doesn't have raises `ValueError` before the UI thread is
+involved. A model already installed changes nothing.
 
 The existing one-setting filament call,
 `orca.host.preset.filament.update(slot_number, key, value)`, remains available as a
