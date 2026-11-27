@@ -498,13 +498,12 @@ void set_filament_slot_colour(int slot_number, const std::string& colour)
     std::transform(html.begin(), html.end(), html.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
 
     PluginHostUi::run_on_ui_thread([&] {
-        GUI::GUI_App& app    = require_gui_app();
-        PresetBundle& bundle = *app.preset_bundle;
-        resolved_slot_preset(bundle, slot_number); // rejects an out-of-range or unresolved slot
+        GUI::GUI_App& app = require_gui_app();
+        // A mixed-color virtual slot's colour comes from its components; refused as begin_update() refuses it.
+        if (const std::optional<GUI::Ops::Refusal> refusal = GUI::Ops::mixed_slot_refusal(slot_number))
+            throw_refusal(*refusal);
+        resolved_slot_preset(*app.preset_bundle, slot_number); // rejects an out-of-range or unresolved slot
         const size_t index = static_cast<size_t>(slot_number) - 1;
-        if (bundle.is_mixed_filament(index))
-            throw std::invalid_argument("Filament slot " + std::to_string(slot_number)
-                                        + " is a mixed-color virtual slot; its colour comes from its components");
         std::vector<GUI::PlaterPresetComboBox*>& slot_combos = app.plater()->sidebar().combos_filament();
         if (index >= slot_combos.size() || slot_combos[index] == nullptr)
             throw std::runtime_error("Filament slot " + std::to_string(slot_number) + " has no selector in the sidebar");
